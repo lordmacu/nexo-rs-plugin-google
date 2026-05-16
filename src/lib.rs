@@ -16,10 +16,12 @@
 //! `<workspace>/<token_file>` keyed by agent_id at the daemon's
 //! `plugin.configure` call.
 
+pub mod auto_discovery;
 pub mod client;
 pub mod cli;
 pub mod env_config;
 pub mod plugin;
+pub mod runtime_handle;
 pub mod tools;
 
 pub use client::{

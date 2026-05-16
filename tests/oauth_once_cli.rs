@@ -31,7 +31,7 @@ fn print_manifest_emits_valid_v2_manifest() {
         toml::from_str(&stdout).expect("emitted manifest parses as PluginManifest");
     assert_eq!(parsed.manifest_version, 2);
     assert_eq!(parsed.plugin.id, "google");
-    assert_eq!(parsed.plugin.tools.outbound.len(), 4);
+    assert_eq!(parsed.plugin.extends.tools.len(), 4);
 }
 
 #[test]
@@ -72,16 +72,7 @@ fn oauth_once_missing_required_flag_exits_nonzero() {
     );
 }
 
-#[test]
-fn no_subcommand_exits_nonzero_with_hint() {
-    // Long-lived JSON-RPC dispatch is wired in step 16; until then,
-    // bare invocation must exit non-zero with a clear hint pointing
-    // operators at `--print-manifest` / `--oauth-once`.
-    let out = Command::new(bin_path()).output().expect("spawn binary");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("--print-manifest") || stderr.contains("--oauth-once"),
-        "stderr should hint at available subcommands: {stderr}"
-    );
-}
+// `no_subcommand_exits_nonzero_with_hint` removed in step 16 —
+// bare invocation now enters the long-lived JSON-RPC dispatch loop
+// (see `e2e_handshake.rs::initialize_reply_lists_four_google_tools`
+// for the new contract).

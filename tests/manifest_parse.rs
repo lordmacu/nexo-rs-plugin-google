@@ -15,46 +15,30 @@ fn manifest_parses_as_v2() {
 }
 
 #[test]
-fn outbound_tools_declare_exactly_four() {
+fn extends_tools_declares_exactly_four() {
     let parsed: PluginManifest = toml::from_str(MANIFEST).unwrap();
-    let outbound = &parsed.plugin.tools.outbound;
-    assert_eq!(outbound.len(), 4, "expect 4 outbound tool specs");
-    let names: Vec<&str> = outbound.iter().map(|o| o.name.as_str()).collect();
+    let tools = &parsed.plugin.extends.tools;
+    assert_eq!(tools.len(), 4);
     assert_eq!(
-        names,
-        vec![
-            "google_auth_start",
-            "google_auth_status",
-            "google_call",
-            "google_auth_revoke",
+        tools,
+        &vec![
+            "google_auth_start".to_string(),
+            "google_auth_status".to_string(),
+            "google_call".to_string(),
+            "google_auth_revoke".to_string(),
         ]
     );
 }
 
 #[test]
-fn expose_list_matches_outbound_names() {
+fn expose_list_matches_extends_tools() {
     let parsed: PluginManifest = toml::from_str(MANIFEST).unwrap();
     let exposed = &parsed.plugin.tools.expose;
     assert_eq!(exposed.len(), 4);
-    for spec in &parsed.plugin.tools.outbound {
+    for name in &parsed.plugin.extends.tools {
         assert!(
-            exposed.iter().any(|e| e == &spec.name),
-            "{} missing from expose list",
-            spec.name
-        );
-    }
-}
-
-#[test]
-fn outbound_input_schemas_are_valid_json() {
-    let parsed: PluginManifest = toml::from_str(MANIFEST).unwrap();
-    for spec in &parsed.plugin.tools.outbound {
-        let v: serde_json::Value = serde_json::from_str(&spec.input_schema)
-            .unwrap_or_else(|e| panic!("{}: input_schema not JSON: {e}", spec.name));
-        assert_eq!(
-            v["type"], "object",
-            "{}: input schema must be type=object",
-            spec.name
+            exposed.contains(name),
+            "{name} missing from tools.expose list"
         );
     }
 }
