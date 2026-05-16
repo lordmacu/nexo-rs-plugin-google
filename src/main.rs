@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use nexo_plugin_google::auto_discovery;
 use nexo_plugin_google::cli::{Cli, Command};
 use nexo_plugin_google::env_config::google_config_from_env;
-use nexo_plugin_google::plugin::{GooglePlugin, GooglePluginConfig};
+use nexo_plugin_google::plugin::{GoogleAuthFile, GooglePlugin};
 use nexo_plugin_google::runtime_handle;
 use nexo_plugin_google::tools::tool_defs;
 
@@ -66,16 +66,26 @@ async fn main() -> anyhow::Result<()> {
     let plugin = Arc::new(GooglePlugin::new());
     runtime_handle::set_runtime_handle(plugin.clone()).await;
 
-    // Load fallback env config if NEXO_PLUGIN_GOOGLE_CONFIG_PATH is
-    // set. Daemon's `plugin.configure` overrides this later.
+    // Phase 94 v0.2.1 — eager-load `$NEXO_CONFIG_DIR/plugins/google-auth.yaml`
+    // (or `NEXO_PLUGIN_GOOGLE_CONFIG_PATH` override) so the plugin
+    // is functional even when the daemon's `plugin.configure`
+    // round-trip races the first tool call. `plugin.configure`
+    // re-applies the same shape later when the daemon delivers via
+    // JSON-RPC.
     match google_config_from_env() {
         Ok(env_cfg) => {
-            if !env_cfg.initial_configs.is_empty() {
-                if let Err(e) = plugin.on_configure(env_cfg.initial_configs).await {
+            if let Some(initial) = env_cfg.initial {
+                if let Err(e) = plugin.on_configure(initial).await {
                     tracing::warn!(
                         target = "nexo_plugin_google",
                         error = %e,
                         "env-based on_configure failed"
+                    );
+                } else if let Some(path) = env_cfg.config_path {
+                    tracing::info!(
+                        target = "nexo_plugin_google",
+                        path = %path.display(),
+                        "loaded initial google-auth.yaml"
                     );
                 }
             }
@@ -110,14 +120,17 @@ async fn main() -> anyhow::Result<()> {
 
     let adapter = PluginAdapter::new(MANIFEST)?
         .declare_tools(tool_defs())
-        // Phase 93.4 — host delivers per-agent operator YAML.
+        // Phase 93.4 — host delivers operator YAML for the
+        // `[plugin.config_schema] shape = "object"` contract. The
+        // shape matches `google-auth.yaml` (top-level object with
+        // `accounts: [...]`).
         .on_configure(move |value: serde_yaml::Value| {
             let plugin = plugin_for_configure.clone();
             async move {
-                let configs: Vec<GooglePluginConfig> = serde_yaml::from_value(value)
-                    .map_err(|e| format!("invalid google plugin config: {e}"))?;
+                let file: GoogleAuthFile = serde_yaml::from_value(value)
+                    .map_err(|e| format!("invalid google-auth.yaml: {e}"))?;
                 plugin
-                    .on_configure(configs)
+                    .on_configure(file)
                     .await
                     .map_err(|e| format!("on_configure: {e}"))
             }

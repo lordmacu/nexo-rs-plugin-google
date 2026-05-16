@@ -1,12 +1,26 @@
-//! Subprocess plugin runtime.
+//! Subprocess plugin runtime — multi-instance × multi-account.
 //!
-//! Holds one `Arc<GoogleAuthClient>` per agent in a DashMap, keyed
-//! by `agent_id`. The daemon's `[plugin.configure]` JSON-RPC delivers
-//! the per-agent config list at boot; the four `google_*` tools
-//! dispatch through `invoke_outbound_tool` which reads `agent_id`
-//! from the JSON-RPC `params`.
+//! Operators describe their Google accounts in a single
+//! `google-auth.yaml` mirroring the legacy in-tree shape:
+//!
+//! ```yaml
+//! accounts:
+//!   - id: ana@gmail.com
+//!     agent_id: ana
+//!     client_id_path:     ./secrets/ana_client_id.txt
+//!     client_secret_path: ./secrets/ana_client_secret.txt
+//!     token_path:         ./secrets/ana_token.json
+//!     scopes: [gmail.readonly, calendar]
+//!     redirect_port: 8765
+//! ```
+//!
+//! The plugin holds one `Arc<GoogleAuthClient>` per `accounts[].id`
+//! and a per-agent lookup table mapping `agent_id → [account_id, ...]`
+//! so tools dispatch with optional `account:` arg (defaulting to the
+//! first account for the calling agent). Mirrors the email plugin's
+//! tenant × account fanout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -14,42 +28,53 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::client::{GoogleAuthClient, GoogleAuthConfig};
+use crate::client::{GoogleAuthClient, GoogleAuthConfig, SecretSources};
 
-/// Opaque per-agent config delivered by `plugin.configure`. Mirrors
-/// the YAML shape declared in the manifest's `[plugin.config_schema]`.
+/// Operator-facing top-level config (mirrors `google-auth.yaml`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GoogleAuthFile {
+    #[serde(default)]
+    pub accounts: Vec<GoogleAccount>,
+}
+
+/// Single Google account binding declared in `google-auth.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct GooglePluginConfig {
-    /// Agent identifier the OAuth client belongs to. Used as DashMap key.
+pub struct GoogleAccount {
+    /// Account identifier, conventionally the email address. Unique
+    /// across the file. Tools accept it via the optional
+    /// `account` arg.
+    pub id: String,
+    /// Agent that owns this account. Multiple accounts MAY share
+    /// the same `agent_id` (multi-account-per-agent).
     pub agent_id: String,
-    /// Workspace directory. Token file resolves here when relative.
-    pub workspace_dir: String,
-    pub client_id: String,
-    pub client_secret: String,
+    /// Path to a file holding the OAuth client_id.
+    pub client_id_path: PathBuf,
+    /// Path to a file holding the OAuth client_secret.
+    pub client_secret_path: PathBuf,
+    /// Where to persist tokens. Absolute or relative to CWD.
+    pub token_path: PathBuf,
+    /// Granted OAuth scopes. Short forms (`gmail.readonly`) get
+    /// expanded by `canonicalize_scopes` inside the client.
     #[serde(default)]
     pub scopes: Vec<String>,
-    #[serde(default = "default_token_file")]
-    pub token_file: String,
+    /// Loopback callback port for `google_auth_start`. Default 8765.
     #[serde(default = "default_redirect_port")]
     pub redirect_port: u16,
 }
 
-fn default_token_file() -> String {
-    "google_tokens.json".to_string()
-}
 fn default_redirect_port() -> u16 {
     8765
 }
 
-/// Process-wide google plugin state. Built once at boot; refreshed
-/// incrementally by every `plugin.configure` call.
-///
-/// Full-replace semantics on `on_configure`: a fresh list replaces
-/// the entire DashMap so removing an agent's `google_auth:` block
-/// drops its in-memory client. Mirrors email's tenant-set behaviour.
+/// Plugin-side process-wide state.
 pub struct GooglePlugin {
-    clients: DashMap<String, Arc<GoogleAuthClient>>,
+    /// account_id → client.
+    accounts: DashMap<String, Arc<GoogleAuthClient>>,
+    /// agent_id → ordered list of account_ids the agent owns. The
+    /// first entry is the default account when the LLM omits the
+    /// `account` arg.
+    by_agent: DashMap<String, Vec<String>>,
 }
 
 impl Default for GooglePlugin {
@@ -61,98 +86,179 @@ impl Default for GooglePlugin {
 impl GooglePlugin {
     pub fn new() -> Self {
         Self {
-            clients: DashMap::new(),
+            accounts: DashMap::new(),
+            by_agent: DashMap::new(),
         }
     }
 
-    /// Number of agents currently configured. Used by observability +
-    /// tests.
-    pub fn agent_count(&self) -> usize {
-        self.clients.len()
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
     }
 
-    /// Replace the agent → client map with a fresh set built from
-    /// the supplied configs. `load_from_disk` runs in parallel so
-    /// existing tokens come back into memory before the first tool
-    /// call.
-    pub async fn on_configure(&self, configs: Vec<GooglePluginConfig>) -> Result<()> {
-        // Build the new map first; only swap once every client is
-        // constructed. Failed disk loads warn-only — the agent can
-        // still re-auth via `google_auth_start`.
-        let next: DashMap<String, Arc<GoogleAuthClient>> = DashMap::new();
-        for cfg in configs {
-            let agent_id = cfg.agent_id.clone();
-            let workspace = PathBuf::from(&cfg.workspace_dir);
-            let client_cfg = GoogleAuthConfig {
-                client_id: cfg.client_id,
-                client_secret: cfg.client_secret,
-                scopes: cfg.scopes,
-                token_file: cfg.token_file,
-                redirect_port: cfg.redirect_port,
+    pub fn agent_count(&self) -> usize {
+        self.by_agent.len()
+    }
+
+    /// Replace the in-memory state from a parsed `google-auth.yaml`.
+    /// Full-replace semantics: prior accounts not present in the
+    /// new payload are dropped. File-path reads happen lazily here
+    /// (so a rotation between configures is honoured), and the
+    /// resulting client carries `SecretSources` for lazy refresh
+    /// on subsequent mtime changes.
+    pub async fn on_configure(&self, file: GoogleAuthFile) -> Result<()> {
+        let next_accounts: DashMap<String, Arc<GoogleAuthClient>> = DashMap::new();
+        let next_by_agent: DashMap<String, Vec<String>> = DashMap::new();
+
+        for acct in file.accounts {
+            let client_id = read_trim(&acct.client_id_path).with_context(|| {
+                format!(
+                    "account `{}`: reading client_id from {}",
+                    acct.id,
+                    acct.client_id_path.display()
+                )
+            })?;
+            let client_secret = read_trim(&acct.client_secret_path).with_context(|| {
+                format!(
+                    "account `{}`: reading client_secret from {}",
+                    acct.id,
+                    acct.client_secret_path.display()
+                )
+            })?;
+
+            let token_file = acct.token_path.to_string_lossy().into_owned();
+            let workspace_dir = acct
+                .token_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            let cfg = GoogleAuthConfig {
+                client_id,
+                client_secret,
+                scopes: acct.scopes.clone(),
+                token_file,
+                redirect_port: acct.redirect_port,
             };
-            let client = GoogleAuthClient::new(client_cfg, &workspace);
+            let sources = SecretSources {
+                client_id_path: acct.client_id_path.clone(),
+                client_secret_path: acct.client_secret_path.clone(),
+            };
+            let client =
+                GoogleAuthClient::new_with_sources(cfg, &workspace_dir, Some(sources));
             if let Err(e) = client.load_from_disk().await {
                 tracing::warn!(
                     target = "nexo_plugin_google",
-                    agent = %agent_id,
+                    account = %acct.id,
                     error = %e,
-                    "tokens load failed; agent will need to re-consent"
+                    "tokens load failed; account will need to re-consent"
                 );
             }
-            next.insert(agent_id, client);
+
+            next_accounts.insert(acct.id.clone(), client);
+            next_by_agent
+                .entry(acct.agent_id.clone())
+                .or_default()
+                .push(acct.id.clone());
         }
 
-        self.clients.clear();
-        for (k, v) in next.into_iter() {
-            self.clients.insert(k, v);
+        self.accounts.clear();
+        for (k, v) in next_accounts.into_iter() {
+            self.accounts.insert(k, v);
+        }
+        self.by_agent.clear();
+        for (k, v) in next_by_agent.into_iter() {
+            self.by_agent.insert(k, v);
         }
 
         tracing::info!(
             target = "nexo_plugin_google",
-            agents = self.clients.len(),
+            accounts = self.accounts.len(),
+            agents = self.by_agent.len(),
             "google plugin reconfigured"
         );
         Ok(())
     }
 
-    /// Resolve the per-agent `Arc<GoogleAuthClient>`.
-    pub fn client_for(&self, agent_id: &str) -> Result<Arc<GoogleAuthClient>> {
-        self.clients
-            .get(agent_id)
+    /// Resolve the per-account `Arc<GoogleAuthClient>`. Public so
+    /// admin handlers can introspect.
+    pub fn client_by_account(&self, account_id: &str) -> Result<Arc<GoogleAuthClient>> {
+        self.accounts
+            .get(account_id)
             .map(|r| Arc::clone(r.value()))
-            .ok_or_else(|| {
-                anyhow!(
-                    "agent `{agent_id}` is not configured for google_auth (no plugin.configure \
-                     entry — daemon did not declare it OR not_configured)"
-                )
-            })
+            .ok_or_else(|| anyhow!("account `{account_id}` is not configured"))
     }
 
-    /// Dispatch a tool call routed via the daemon's outbound RPC
-    /// (`outbound_tool.invoke` OR `tool.invoke` — `rpc_method` is
-    /// caller-provided). `agent_id` is required + comes from the
-    /// JSON-RPC `params`.
+    /// Resolve the per-agent default account. Returns the first
+    /// account in the agent's list; errors if the agent has no
+    /// accounts.
+    pub fn default_account_for(&self, agent_id: &str) -> Result<String> {
+        let list = self
+            .by_agent
+            .get(agent_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "agent `{agent_id}` is not configured for google_auth \
+                     (no entry in `google-auth.yaml::accounts[].agent_id`)"
+                )
+            })?;
+        list.first().cloned().ok_or_else(|| {
+            anyhow!("agent `{agent_id}` is configured but has zero accounts")
+        })
+    }
+
+    /// Pick the account this call targets:
+    ///   1. `args.account` (operator-supplied);
+    ///   2. else fall back to the agent's default (first) account.
+    fn resolve_account(&self, args: &Value, agent_id: &str) -> Result<String> {
+        if let Some(explicit) = args.get("account").and_then(|v| v.as_str()) {
+            return Ok(explicit.to_string());
+        }
+        self.default_account_for(agent_id)
+    }
+
+    pub fn accounts_for_agent(&self, agent_id: &str) -> Vec<String> {
+        self.by_agent
+            .get(agent_id)
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Dispatch a `tool.invoke` call. The daemon's RemoteToolHandler
+    /// passes the LLM's `args` payload plus `agent_id` from the
+    /// per-agent context.
     pub async fn invoke_outbound_tool(
         &self,
         tool_name: &str,
         args: Value,
         agent_id: &str,
     ) -> Result<Value> {
-        let client = self.client_for(agent_id)?;
+        let account_id = self.resolve_account(&args, agent_id)?;
+        let client = self.client_by_account(&account_id)?;
         match tool_name {
-            "google_auth_start" => self.tool_auth_start(&client).await,
-            "google_auth_status" => Ok(client.snapshot().await),
-            "google_call" => self.tool_call(&client, &args).await,
-            "google_auth_revoke" => self.tool_revoke(&client).await,
+            "google_auth_start" => self.tool_auth_start(&client, &account_id).await,
+            "google_auth_status" => {
+                let mut snap = client.snapshot().await;
+                if let Some(map) = snap.as_object_mut() {
+                    map.insert("account".into(), json!(account_id));
+                }
+                Ok(snap)
+            }
+            "google_call" => self.tool_call(&client, &args, &account_id).await,
+            "google_auth_revoke" => self.tool_revoke(&client, &account_id).await,
             other => Err(anyhow!("unknown tool `{other}`")),
         }
     }
 
-    async fn tool_auth_start(&self, client: &Arc<GoogleAuthClient>) -> Result<Value> {
+    async fn tool_auth_start(
+        &self,
+        client: &Arc<GoogleAuthClient>,
+        account_id: &str,
+    ) -> Result<Value> {
         let (url, _join) = client.start_auth_flow().await?;
         let redirect_port = client.config().redirect_port;
         Ok(json!({
             "ok": true,
+            "account": account_id,
             "url": url,
             "instructions": "Open this URL in a browser you're logged into \
                 your Google account with, approve the scopes, then call \
@@ -161,7 +267,12 @@ impl GooglePlugin {
         }))
     }
 
-    async fn tool_call(&self, client: &Arc<GoogleAuthClient>, args: &Value) -> Result<Value> {
+    async fn tool_call(
+        &self,
+        client: &Arc<GoogleAuthClient>,
+        args: &Value,
+        account_id: &str,
+    ) -> Result<Value> {
         let method = args["method"]
             .as_str()
             .ok_or_else(|| anyhow!("google_call requires `method`"))?;
@@ -173,143 +284,199 @@ impl GooglePlugin {
                 "google_call only accepts https://*.googleapis.com URLs — got `{url}`"
             ));
         }
-        let body = args
-            .get("body")
-            .filter(|b| !b.is_null())
-            .cloned();
+        let body = args.get("body").filter(|b| !b.is_null()).cloned();
         let resp = client.authorized_call(method, url, body).await?;
-        Ok(json!({ "ok": true, "response": resp }))
+        Ok(json!({ "ok": true, "account": account_id, "response": resp }))
     }
 
-    async fn tool_revoke(&self, client: &Arc<GoogleAuthClient>) -> Result<Value> {
+    async fn tool_revoke(
+        &self,
+        client: &Arc<GoogleAuthClient>,
+        account_id: &str,
+    ) -> Result<Value> {
         client.revoke().await?;
-        Ok(json!({ "ok": true, "message": "tokens revoked + wiped" }))
+        Ok(json!({
+            "ok": true,
+            "account": account_id,
+            "message": "tokens revoked + wiped"
+        }))
     }
 
     // ── Admin handlers ──────────────────────────────────────────
 
-    /// Admin RPC: `nexo/admin/google/oauth_status` →
-    /// per-agent OAuth snapshot.
-    pub async fn admin_oauth_status(&self, agent_id: &str) -> Result<Value> {
-        let client = self.client_for(agent_id)?;
-        Ok(client.snapshot().await)
+    pub async fn admin_oauth_status(&self, agent_id: &str, account: Option<&str>) -> Result<Value> {
+        let account_id = match account {
+            Some(a) => a.to_string(),
+            None => self.default_account_for(agent_id)?,
+        };
+        let client = self.client_by_account(&account_id)?;
+        let mut snap = client.snapshot().await;
+        if let Some(map) = snap.as_object_mut() {
+            map.insert("account".into(), json!(account_id));
+        }
+        Ok(snap)
     }
 
-    /// Admin RPC: `nexo/admin/google/oauth_revoke` → revoke + wipe.
-    pub async fn admin_oauth_revoke(&self, agent_id: &str) -> Result<Value> {
-        let client = self.client_for(agent_id)?;
+    pub async fn admin_oauth_revoke(&self, agent_id: &str, account: Option<&str>) -> Result<Value> {
+        let account_id = match account {
+            Some(a) => a.to_string(),
+            None => self.default_account_for(agent_id)?,
+        };
+        let client = self.client_by_account(&account_id)?;
         client.revoke().await?;
-        Ok(json!({ "ok": true, "agent_id": agent_id }))
+        Ok(json!({ "ok": true, "agent_id": agent_id, "account": account_id }))
     }
 
-    /// Admin RPC: `nexo/admin/google/list_tokens` → snapshot per
-    /// configured agent.
     pub async fn admin_list_tokens(&self) -> Result<Value> {
-        let mut out: Vec<Value> = Vec::with_capacity(self.clients.len());
-        // Collect keys first to avoid holding dashmap iter across `.await`.
-        let agent_ids: Vec<String> = self
-            .clients
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        for agent_id in agent_ids {
-            let Some(client_arc) = self.clients.get(&agent_id).map(|r| Arc::clone(r.value())) else {
+        let mut out: Vec<Value> = Vec::with_capacity(self.accounts.len());
+        let account_ids: Vec<String> =
+            self.accounts.iter().map(|e| e.key().clone()).collect();
+        for account_id in account_ids {
+            let Some(client_arc) = self
+                .accounts
+                .get(&account_id)
+                .map(|r| Arc::clone(r.value()))
+            else {
                 continue;
             };
             let snap = client_arc.snapshot().await;
             out.push(json!({
-                "agent_id": agent_id,
+                "account": account_id,
                 "status": snap,
             }));
         }
-        Ok(json!({ "agents": out }))
+        // Also expose agent → accounts mapping so the admin UI can
+        // render multi-account UX.
+        let mut agents: Vec<Value> = Vec::with_capacity(self.by_agent.len());
+        for entry in self.by_agent.iter() {
+            agents.push(json!({
+                "agent_id": entry.key(),
+                "accounts": entry.value(),
+            }));
+        }
+        Ok(json!({ "accounts": out, "agents": agents }))
     }
 }
 
-/// Extract `agent_id` from a JSON-RPC params object. Looks first
-/// for the canonical top-level field; falls back to a `_meta`
-/// envelope so daemon paths that nest metadata still resolve.
-pub fn extract_agent_id(params: &Value) -> Result<String> {
-    params
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| params.get("_meta").and_then(|m| m.get("agent_id")).and_then(|v| v.as_str()))
-        .map(|s| s.to_string())
-        .context(
-            "outbound tool call is missing `agent_id` in params \
-             (daemon must include it — Phase 94 Stage 5 agnostic infra)",
-        )
+fn read_trim(path: &Path) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    Ok(raw.trim().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg(id: &str, ws: &str) -> GooglePluginConfig {
-        GooglePluginConfig {
-            agent_id: id.into(),
-            workspace_dir: ws.into(),
-            client_id: "test-cid".into(),
-            client_secret: "test-cs".into(),
+    fn account(id: &str, agent: &str, dir: &Path) -> (GoogleAccount, PathBuf, PathBuf) {
+        let cid_path = dir.join(format!("{id}_cid.txt"));
+        let cs_path = dir.join(format!("{id}_cs.txt"));
+        std::fs::write(&cid_path, "test-cid").unwrap();
+        std::fs::write(&cs_path, "test-cs").unwrap();
+        let acct = GoogleAccount {
+            id: id.into(),
+            agent_id: agent.into(),
+            client_id_path: cid_path.clone(),
+            client_secret_path: cs_path.clone(),
+            token_path: dir.join(format!("{id}_token.json")),
             scopes: vec!["gmail.readonly".into()],
-            token_file: "google_tokens.json".into(),
-            redirect_port: 0, // tests don't bind
-        }
+            redirect_port: 0,
+        };
+        (acct, cid_path, cs_path)
     }
 
     #[tokio::test]
-    async fn on_configure_populates_dashmap() {
+    async fn on_configure_loads_two_accounts_one_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        let configs = vec![
-            cfg("agent_a", &dir.path().join("a").to_string_lossy()),
-            cfg("agent_b", &dir.path().join("b").to_string_lossy()),
-        ];
-        p.on_configure(configs).await.unwrap();
-        assert_eq!(p.agent_count(), 2);
-        assert!(p.client_for("agent_a").is_ok());
-        assert!(p.client_for("agent_b").is_ok());
-    }
+        let plugin = GooglePlugin::new();
 
-    #[tokio::test]
-    async fn on_configure_full_replace_drops_removed_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![
-            cfg("agent_a", &dir.path().join("a").to_string_lossy()),
-            cfg("agent_b", &dir.path().join("b").to_string_lossy()),
-        ])
-        .await
-        .unwrap();
-        assert_eq!(p.agent_count(), 2);
-        // Second configure with only agent_c → both prior agents dropped.
-        p.on_configure(vec![cfg("agent_c", &dir.path().join("c").to_string_lossy())])
+        let (a1, _, _) = account("ana@gmail.com", "ana", dir.path());
+        let (a2, _, _) = account("ana@work.com", "ana", dir.path());
+
+        plugin
+            .on_configure(GoogleAuthFile {
+                accounts: vec![a1, a2],
+            })
             .await
             .unwrap();
-        assert_eq!(p.agent_count(), 1);
-        assert!(p.client_for("agent_a").is_err());
-        assert!(p.client_for("agent_c").is_ok());
+
+        assert_eq!(plugin.account_count(), 2);
+        assert_eq!(plugin.agent_count(), 1);
+        let accounts_for_ana = plugin.accounts_for_agent("ana");
+        assert_eq!(accounts_for_ana.len(), 2);
+        assert!(accounts_for_ana.contains(&"ana@gmail.com".to_string()));
+        assert!(accounts_for_ana.contains(&"ana@work.com".to_string()));
     }
 
     #[tokio::test]
-    async fn invoke_outbound_tool_returns_status_for_known_agent() {
+    async fn full_replace_on_second_configure() {
         let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![cfg("agent_x", &dir.path().to_string_lossy())])
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("a@gmail.com", "ana", dir.path());
+        let (b, _, _) = account("b@gmail.com", "bob", dir.path());
+
+        plugin
+            .on_configure(GoogleAuthFile {
+                accounts: vec![a, b],
+            })
             .await
             .unwrap();
-        let result = p
-            .invoke_outbound_tool("google_auth_status", json!({}), "agent_x")
+        assert_eq!(plugin.account_count(), 2);
+
+        let (a, _, _) = account("a@gmail.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile { accounts: vec![a] })
             .await
             .unwrap();
-        // No tokens persisted → authenticated:false snapshot.
-        assert_eq!(result["authenticated"], json!(false));
+        assert_eq!(plugin.account_count(), 1);
+        assert!(plugin.accounts_for_agent("bob").is_empty());
     }
 
     #[tokio::test]
-    async fn invoke_outbound_tool_unknown_agent_errors() {
-        let p = GooglePlugin::new();
-        let err = p
+    async fn invoke_resolves_default_account_for_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("ana@gmail.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile { accounts: vec![a] })
+            .await
+            .unwrap();
+
+        let out = plugin
+            .invoke_outbound_tool("google_auth_status", json!({}), "ana")
+            .await
+            .unwrap();
+        assert_eq!(out["account"], json!("ana@gmail.com"));
+        assert_eq!(out["authenticated"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn invoke_picks_explicit_account_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("ana@gmail.com", "ana", dir.path());
+        let (b, _, _) = account("ana@work.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile {
+                accounts: vec![a, b],
+            })
+            .await
+            .unwrap();
+
+        let out = plugin
+            .invoke_outbound_tool(
+                "google_auth_status",
+                json!({ "account": "ana@work.com" }),
+                "ana",
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["account"], json!("ana@work.com"));
+    }
+
+    #[tokio::test]
+    async fn invoke_unknown_agent_errors() {
+        let plugin = GooglePlugin::new();
+        let err = plugin
             .invoke_outbound_tool("google_auth_status", json!({}), "ghost")
             .await
             .unwrap_err();
@@ -318,31 +485,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_outbound_tool_unknown_tool_errors() {
+    async fn invoke_unknown_account_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![cfg("agent_x", &dir.path().to_string_lossy())])
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("ana@gmail.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile { accounts: vec![a] })
             .await
             .unwrap();
-        let err = p
-            .invoke_outbound_tool("google_does_not_exist", json!({}), "agent_x")
+
+        let err = plugin
+            .invoke_outbound_tool(
+                "google_auth_status",
+                json!({ "account": "nobody@gmail.com" }),
+                "ana",
+            )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("unknown tool"));
+        assert!(err.to_string().contains("nobody@gmail.com"));
     }
 
     #[tokio::test]
-    async fn google_call_rejects_non_googleapis_url() {
+    async fn google_call_rejects_non_googleapis_host() {
         let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![cfg("agent_x", &dir.path().to_string_lossy())])
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("a@gmail.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile { accounts: vec![a] })
             .await
             .unwrap();
-        let err = p
+        let err = plugin
             .invoke_outbound_tool(
                 "google_call",
                 json!({ "method": "GET", "url": "https://evil.example.com/" }),
-                "agent_x",
+                "ana",
             )
             .await
             .unwrap_err();
@@ -350,52 +526,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_oauth_status_returns_snapshot() {
+    async fn admin_list_tokens_returns_per_account_and_per_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![cfg("agent_x", &dir.path().to_string_lossy())])
+        let plugin = GooglePlugin::new();
+        let (a, _, _) = account("a@gmail.com", "ana", dir.path());
+        let (b, _, _) = account("b@gmail.com", "ana", dir.path());
+        plugin
+            .on_configure(GoogleAuthFile {
+                accounts: vec![a, b],
+            })
             .await
             .unwrap();
-        let snap = p.admin_oauth_status("agent_x").await.unwrap();
-        assert_eq!(snap["authenticated"], json!(false));
-    }
-
-    #[tokio::test]
-    async fn admin_list_tokens_enumerates_configured_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = GooglePlugin::new();
-        p.on_configure(vec![
-            cfg("agent_a", &dir.path().join("a").to_string_lossy()),
-            cfg("agent_b", &dir.path().join("b").to_string_lossy()),
-        ])
-        .await
-        .unwrap();
-        let listing = p.admin_list_tokens().await.unwrap();
-        let agents = listing["agents"].as_array().expect("agents array");
-        assert_eq!(agents.len(), 2);
-        let ids: std::collections::HashSet<&str> = agents
-            .iter()
-            .map(|e| e["agent_id"].as_str().unwrap())
-            .collect();
-        assert!(ids.contains("agent_a"));
-        assert!(ids.contains("agent_b"));
-    }
-
-    #[test]
-    fn extract_agent_id_reads_top_level_field() {
-        let p = json!({ "agent_id": "agent_x", "tool_name": "google_call" });
-        assert_eq!(extract_agent_id(&p).unwrap(), "agent_x");
-    }
-
-    #[test]
-    fn extract_agent_id_falls_back_to_meta_envelope() {
-        let p = json!({ "_meta": { "agent_id": "agent_y" } });
-        assert_eq!(extract_agent_id(&p).unwrap(), "agent_y");
-    }
-
-    #[test]
-    fn extract_agent_id_errors_when_absent() {
-        let p = json!({ "tool_name": "google_call" });
-        assert!(extract_agent_id(&p).is_err());
+        let listing = plugin.admin_list_tokens().await.unwrap();
+        assert_eq!(listing["accounts"].as_array().unwrap().len(), 2);
+        let agents = listing["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent_id"], json!("ana"));
+        assert_eq!(agents[0]["accounts"].as_array().unwrap().len(), 2);
     }
 }

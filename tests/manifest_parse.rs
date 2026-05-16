@@ -11,7 +11,7 @@ fn manifest_parses_as_v2() {
         toml::from_str(MANIFEST).expect("nexo-plugin.toml parses as PluginManifest");
     assert_eq!(parsed.manifest_version, 2, "must be v2 canonical");
     assert_eq!(parsed.plugin.id, "google");
-    assert_eq!(parsed.plugin.version.to_string(), "0.2.0");
+    assert_eq!(parsed.plugin.version.to_string(), "0.2.1");
 }
 
 #[test]
@@ -56,14 +56,35 @@ fn admin_section_present_with_correct_prefix() {
 }
 
 #[test]
-fn config_schema_is_array_shape() {
+fn config_schema_is_object_shape_with_accounts_array() {
     let parsed: PluginManifest = toml::from_str(MANIFEST).unwrap();
     let cs = parsed
         .plugin
         .config_schema
         .as_ref()
         .expect("[plugin.config_schema] required");
-    assert_eq!(cs.shape, ConfigShape::Array);
+    assert_eq!(cs.shape, ConfigShape::Object);
+    // The schema string must declare an `accounts` array — that's
+    // the contract operators rely on when authoring
+    // `google-auth.yaml`.
+    assert!(
+        cs.schema.contains("\"accounts\""),
+        "schema must declare an accounts array"
+    );
+}
+
+#[test]
+fn credentials_schema_opted_out() {
+    let parsed: PluginManifest = toml::from_str(MANIFEST).unwrap();
+    let cs = parsed
+        .plugin
+        .credentials_schema
+        .as_ref()
+        .expect("[plugin.credentials_schema] required (even when opting out)");
+    assert!(
+        !cs.enabled,
+        "google plugin reads OAuth file refs directly; no RemoteCredentialStore"
+    );
 }
 
 #[test]

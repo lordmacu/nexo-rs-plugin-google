@@ -10,15 +10,16 @@
 //!   * `google_call`        — authenticated HTTP call.
 //!   * `google_auth_revoke` — revoke + wipe local tokens.
 //!
-//! Subprocess shape: one process covers every agent with
-//! `google_auth:` configured in `agents.yaml`. Per-agent state
-//! (refresh_token, access_token, scopes) lives in
-//! `<workspace>/<token_file>` keyed by agent_id at the daemon's
-//! `plugin.configure` call.
+//! Multi-instance × multi-account: one subprocess holds N
+//! `Arc<GoogleAuthClient>`s keyed by account id (operator-chosen,
+//! conventionally an email address). Each account binds to an
+//! `agent_id`; an agent MAY own multiple accounts (default + work,
+//! etc.). Tools accept an optional `account` arg; absent → the
+//! agent's first account.
 
 pub mod auto_discovery;
-pub mod client;
 pub mod cli;
+pub mod client;
 pub mod env_config;
 pub mod plugin;
 pub mod runtime_handle;
@@ -28,6 +29,6 @@ pub use client::{
     canonicalize_scopes, DeviceChallenge, GoogleAuthClient, GoogleAuthConfig, GoogleTokens,
     SecretSources,
 };
-pub use plugin::{GooglePlugin, GooglePluginConfig};
+pub use plugin::{GoogleAccount, GoogleAuthFile, GooglePlugin};
 
 pub use cli::{Cli, Command, OauthOnceArgs};

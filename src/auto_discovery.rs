@@ -57,6 +57,7 @@ pub async fn admin_handle(request: &Value) -> Value {
                 "plugin": "google",
                 "version": env!("CARGO_PKG_VERSION"),
                 "configured_agents": plugin.agent_count(),
+                "configured_accounts": plugin.account_count(),
             },
         }),
 
@@ -67,7 +68,8 @@ pub async fn admin_handle(request: &Value) -> Value {
                     "error": "missing required param `agent_id`",
                 });
             };
-            match plugin.admin_oauth_status(agent_id).await {
+            let account = params.get("account").and_then(|v| v.as_str());
+            match plugin.admin_oauth_status(agent_id, account).await {
                 Ok(snap) => json!({ "ok": true, "result": snap }),
                 Err(e) => json!({ "ok": false, "error": format!("{e}") }),
             }
@@ -80,7 +82,8 @@ pub async fn admin_handle(request: &Value) -> Value {
                     "error": "missing required param `agent_id`",
                 });
             };
-            match plugin.admin_oauth_revoke(agent_id).await {
+            let account = params.get("account").and_then(|v| v.as_str());
+            match plugin.admin_oauth_revoke(agent_id, account).await {
                 Ok(v) => json!({ "ok": true, "result": v }),
                 Err(e) => json!({ "ok": false, "error": format!("{e}") }),
             }
@@ -101,24 +104,29 @@ pub async fn admin_handle(request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::{GooglePlugin, GooglePluginConfig};
+    use crate::plugin::{GoogleAccount, GoogleAuthFile, GooglePlugin};
     use serial_test::serial;
 
     async fn boot_with_one_agent() -> Arc<GooglePlugin> {
         let dir = tempfile::tempdir().unwrap();
+        let cid_path = dir.path().join("cid.txt");
+        let cs_path = dir.path().join("cs.txt");
+        std::fs::write(&cid_path, "test-cid").unwrap();
+        std::fs::write(&cs_path, "test-cs").unwrap();
         let p = Arc::new(GooglePlugin::new());
-        p.on_configure(vec![GooglePluginConfig {
-            agent_id: "agent_x".into(),
-            workspace_dir: dir.path().to_string_lossy().into_owned(),
-            client_id: "cid".into(),
-            client_secret: "cs".into(),
-            scopes: vec!["gmail.readonly".into()],
-            token_file: "google_tokens.json".into(),
-            redirect_port: 0,
-        }])
+        p.on_configure(GoogleAuthFile {
+            accounts: vec![GoogleAccount {
+                id: "agent_x@gmail.com".into(),
+                agent_id: "agent_x".into(),
+                client_id_path: cid_path,
+                client_secret_path: cs_path,
+                token_path: dir.path().join("tok.json"),
+                scopes: vec!["gmail.readonly".into()],
+                redirect_port: 0,
+            }],
+        })
         .await
         .unwrap();
-        // intentionally leak dir handle until test exits
         std::mem::forget(dir);
         runtime_handle::set_runtime_handle(p.clone()).await;
         p

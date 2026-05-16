@@ -15,7 +15,7 @@ manifest_version = 2
 
 [plugin]
 id               = "google"
-version          = "0.2.0"
+version          = "0.2.1"
 name             = "Google Workspace"
 description      = "Google OAuth + Gmail/Calendar/Drive API tool plugin for Nexo agents."
 min_nexo_version = ">=0.1.19"
@@ -77,33 +77,51 @@ broker_topic_prefix = "plugin.google.admin"
 timeout_seconds     = 15
 
 # Phase 93.4 — declarative config contract. Daemon delivers
-# operator YAML at `cfg.plugins.entries.google` via
-# `plugin.configure` JSON-RPC; SDK `on_configure` handler
-# deserialises into `Vec<GooglePluginConfig>` (per-agent shape).
+# Phase 94 v0.2.1 — operator YAML at
+# `<config_dir>/plugins/google-auth.yaml` (legacy stem retained for
+# back-compat) — daemon's discovery walker reads it into
+# `entries["google-auth"]` and the plugin merges from there OR
+# directly reads `$NEXO_CONFIG_DIR/plugins/google-auth.yaml` (the
+# preferred path so legacy operators aren't forced to rename).
+# Both code paths land in the same in-memory state.
+#
+# Top-level shape is an object with `accounts:` array, mirroring
+# the `google-auth.yaml` operators already maintain. Each account
+# binds to an agent via `agent_id`; an agent can hold MULTIPLE
+# Google accounts (multi-instance × multi-agent), matching email's
+# pattern.
 [plugin.config_schema]
-shape  = "array"
+shape  = "object"
 schema = '''{
   "type": "object",
   "properties": {
-    "agent_id":       { "type": "string" },
-    "workspace_dir":  { "type": "string" },
-    "client_id":      { "type": "string" },
-    "client_secret":  { "type": "string" },
-    "scopes":         { "type": "array", "items": { "type": "string" } },
-    "token_file":     { "type": "string" },
-    "redirect_port":  { "type": "integer", "minimum": 0, "maximum": 65535 }
+    "accounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id":                  { "type": "string" },
+          "agent_id":            { "type": "string" },
+          "client_id_path":      { "type": "string" },
+          "client_secret_path":  { "type": "string" },
+          "token_path":          { "type": "string" },
+          "scopes":              { "type": "array", "items": { "type": "string" } },
+          "redirect_port":       { "type": "integer", "minimum": 0, "maximum": 65535 }
+        },
+        "required": ["id", "agent_id", "client_id_path", "client_secret_path", "token_path", "scopes"]
+      }
+    }
   },
-  "required": ["agent_id", "workspace_dir", "client_id", "client_secret", "scopes"]
+  "required": ["accounts"]
 }'''
 
-# Phase 93.8.c — credential store contribution. Daemon's
-# `SubprocessNexoPlugin::credential_store()` reads this and
-# constructs a `RemoteCredentialStore` round-tripping the four
-# `plugin.credentials.*` JSON-RPCs to handlers registered in
-# `src/main.rs` (added in Phase 4 of the plan).
+# Phase 94 v0.2.1 — credential store opt-out. Google's OAuth
+# credentials live as file paths inside `google-auth.yaml` accounts;
+# the plugin reads them directly via `SecretSources` (lazy refresh on
+# mtime change). The generic `RemoteCredentialStore` abstraction
+# would just add JSON-RPC round-trips without value.
 [plugin.credentials_schema]
-enabled        = true
-accounts_shape = "array"
+enabled = false
 
 # Phase 81.33.b.real Stage 6 — setup wizard dashboard surface.
 # Google is multi-agent-internal: the wizard walks per-agent
