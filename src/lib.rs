@@ -27,3 +27,5 @@ pub use client::{
     SecretSources,
 };
 pub use plugin::{GooglePlugin, GooglePluginConfig};
+
+pub use cli::{Cli, Command, OauthOnceArgs};
