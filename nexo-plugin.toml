@@ -1,0 +1,136 @@
+# Phase 94 — out-of-tree standalone subprocess plugin.
+#
+# This manifest is parsed at compile-time via `include_str!` in
+# `src/main.rs` and shipped alongside the binary so the nexo-rs
+# daemon's discovery walker can register the plugin without
+# spawning the subprocess. Operators add the directory containing
+# this file to `plugins.discovery.search_paths`.
+#
+# Google is a SINGLE plugin instance that manages N internal
+# per-agent OAuth clients via `Vec<GooglePluginConfig>` delivered
+# at `plugin.configure` time. Mirrors the email plugin's
+# multi-account-internal shape.
+
+manifest_version = 2
+
+[plugin]
+id               = "google"
+version          = "0.2.0"
+name             = "Google Workspace"
+description      = "Google OAuth + Gmail/Calendar/Drive API tool plugin for Nexo agents."
+min_nexo_version = ">=0.1.19"
+
+# Phase 81.20.x F1 — discovery walker invokes this command with
+# `--print-manifest` to bootstrap. Operator installs via
+# `cargo install nexo-plugin-google`; binary lands in
+# `$HOME/.cargo/bin/nexo-plugin-google` and the walker
+# auto-discovers without a manifest config edit.
+[plugin.entrypoint]
+command = "nexo-plugin-google"
+
+[plugin.requires]
+nexo_capabilities = ["broker"]
+
+# Phase 81.33.b.real auto-discovery broker handler subscribe
+# allowlist. Defense-in-depth so the plugin can only handle the
+# topics it owns.
+[plugin.capabilities.broker]
+subscribe = [
+    "plugin.outbound.google",
+    "plugin.outbound.google.>",
+    "plugin.google.admin.>",
+]
+publish = []
+
+# Phase 81.33.a — declarative outbound tool registry. Daemon-side
+# `SubprocessNexoPlugin::register_outbound_tools` iterates these
+# entries and installs one `GenericRpcToolHandler` per tool against
+# the per-agent ToolRegistry. The plugin subprocess handles
+# `outbound_tool.invoke` via its broker handler in
+# `auto_discovery.rs`.
+[plugin.tools]
+expose = [
+    "google_auth_start",
+    "google_auth_status",
+    "google_call",
+    "google_auth_revoke",
+]
+
+[[plugin.tools.outbound]]
+name        = "google_auth_start"
+description = """Begin the Google OAuth consent flow. Returns a URL the user must open in a browser to approve access. The agent must forward the URL to the user via chat and then stop calling Google tools until `google_auth_status` reports authenticated. The callback listener binds on 127.0.0.1 inside the agent process — remote hosts need an SSH tunnel (`ssh -L <port>:127.0.0.1:<port> <host>`). Only call this when `google_auth_status.authenticated` is false — re-calling it invalidates any in-flight consent."""
+input_schema = '{"type":"object","properties":{}}'
+timeout_ms  = 5000
+
+[[plugin.tools.outbound]]
+name        = "google_auth_status"
+description = """Report the current Google OAuth state: `authenticated` (bool), `expires_in_secs` (access token TTL), `has_refresh` (can auto-renew), `scopes` (what access was granted). Safe to call repeatedly — does not touch the network; just reads the on-file tokens. When `authenticated` is false, call `google_auth_start` to kick off the consent flow."""
+input_schema = '{"type":"object","properties":{}}'
+timeout_ms  = 5000
+
+[[plugin.tools.outbound]]
+name        = "google_call"
+description = """Make an authenticated HTTP request against any `*.googleapis.com` endpoint. Method is one of GET, POST, PUT, PATCH, DELETE. `body` (optional) is a JSON value sent as the request payload. The access token is attached as `Authorization: Bearer` and refreshed transparently when stale. Returns the parsed JSON response.
+
+Examples:
+- Gmail inbox: `{method: 'GET', url: 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10'}`
+- Calendar insert: `{method: 'POST', url: 'https://www.googleapis.com/calendar/v3/calendars/primary/events', body: {...}}`
+- Drive list: `{method: 'GET', url: 'https://www.googleapis.com/drive/v3/files?pageSize=50'}`
+
+A 401 typically means the refresh_token was revoked — call `google_auth_start` again. A 403 means the scope wasn't granted; update `google_auth.scopes` in the agent config and re-auth."""
+input_schema = '''{"type":"object","properties":{"method":{"type":"string","enum":["GET","POST","PUT","PATCH","DELETE"],"description":"HTTP method."},"url":{"type":"string","description":"Full URL. Must be https:// — Google API hosts only."},"body":{"type":"object","description":"Optional JSON payload (POST/PUT/PATCH)."}},"required":["method","url"]}'''
+timeout_ms  = 30000
+
+[[plugin.tools.outbound]]
+name        = "google_auth_revoke"
+description = """Revoke the agent's Google refresh_token (so even a leaked copy of the file becomes useless) and delete the local tokens file. The user can still see the agent at myaccount.google.com → Security → Third-party apps until Google's cache clears (minutes). Next `google_call` will fail until the user re-authorises via `google_auth_start`."""
+input_schema = '{"type":"object","properties":{}}'
+timeout_ms  = 10000
+
+# Phase 81.33.b.real Stage 4 — admin RPC commands forwarded via
+# broker. Daemon receives `nexo/admin/google/<verb>` from operators
+# + forwards to `plugin.google.admin.<verb>`.
+[plugin.admin]
+method_prefix       = "nexo/admin/google/"
+broker_topic_prefix = "plugin.google.admin"
+timeout_seconds     = 15
+
+# Phase 93.4 — declarative config contract. Daemon delivers
+# operator YAML at `cfg.plugins.entries.google` via
+# `plugin.configure` JSON-RPC; SDK `on_configure` handler
+# deserialises into `Vec<GooglePluginConfig>` (per-agent shape).
+[plugin.config_schema]
+shape  = "array"
+schema = '''{
+  "type": "object",
+  "properties": {
+    "agent_id":       { "type": "string" },
+    "workspace_dir":  { "type": "string" },
+    "client_id":      { "type": "string" },
+    "client_secret":  { "type": "string" },
+    "scopes":         { "type": "array", "items": { "type": "string" } },
+    "token_file":     { "type": "string" },
+    "redirect_port":  { "type": "integer", "minimum": 0, "maximum": 65535 }
+  },
+  "required": ["agent_id", "workspace_dir", "client_id", "client_secret", "scopes"]
+}'''
+
+# Phase 93.8.c — credential store contribution. Daemon's
+# `SubprocessNexoPlugin::credential_store()` reads this and
+# constructs a `RemoteCredentialStore` round-tripping the four
+# `plugin.credentials.*` JSON-RPCs to handlers registered in
+# `src/main.rs` (added in Phase 4 of the plan).
+[plugin.credentials_schema]
+enabled        = true
+accounts_shape = "array"
+
+# Phase 81.33.b.real Stage 6 — setup wizard dashboard surface.
+# Google is multi-agent-internal: the wizard walks per-agent
+# subdirs of the workspace (one `google_tokens.json` per agent).
+[plugin.dashboard.layout]
+kind   = "workspace_walk"
+subdir = "google"
+
+[plugin.dashboard.auth_check]
+kind       = "session_dir_files"
+candidates = ["google_tokens.json"]
