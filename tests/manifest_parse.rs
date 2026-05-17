@@ -125,10 +125,16 @@ fn capabilities_broker_subscribes_to_outbound_and_admin() {
         .broker
         .as_ref()
         .expect("[plugin.capabilities.broker] required");
-    assert!(broker.subscribe.iter().any(|t| t == "plugin.outbound.google"));
+    assert!(broker
+        .subscribe
+        .iter()
+        .any(|t| t == "plugin.outbound.google"));
     assert!(broker
         .subscribe
         .iter()
         .any(|t| t == "plugin.outbound.google.>"));
-    assert!(broker.subscribe.iter().any(|t| t == "plugin.google.admin.>"));
+    assert!(broker
+        .subscribe
+        .iter()
+        .any(|t| t == "plugin.google.admin.>"));
 }

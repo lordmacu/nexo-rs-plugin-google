@@ -46,9 +46,8 @@ pub fn google_config_from_env() -> anyhow::Result<GoogleEnvConfig> {
     let candidate = resolve_config_path();
     let (initial, config_path) = match candidate.as_ref() {
         Some(path) if path.exists() => {
-            let bytes = std::fs::read(path).map_err(|e| {
-                anyhow::anyhow!("reading google config at {}: {e}", path.display())
-            })?;
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading google config at {}: {e}", path.display()))?;
             let parsed: GoogleAuthFile = serde_yaml::from_slice(&bytes).map_err(|e| {
                 anyhow::anyhow!("parsing google-auth.yaml at {}: {e}", path.display())
             })?;

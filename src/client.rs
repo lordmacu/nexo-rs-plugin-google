@@ -427,7 +427,9 @@ impl GoogleAuthClient {
         };
 
         if state.as_deref() != Some(expected_state) {
-            let _ = stream.write_all(html_err("state mismatch").as_bytes()).await;
+            let _ = stream
+                .write_all(html_err("state mismatch").as_bytes())
+                .await;
             return Err(anyhow!("oauth state mismatch — possibly a replayed tab"));
         }
         let code = match code {

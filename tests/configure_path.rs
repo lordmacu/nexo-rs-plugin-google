@@ -34,7 +34,9 @@ async fn single_account_single_agent_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let p = Arc::new(GooglePlugin::new());
     let a = account("solo@gmail.com", "solo", dir.path());
-    p.on_configure(GoogleAuthFile { accounts: vec![a] }).await.unwrap();
+    p.on_configure(GoogleAuthFile { accounts: vec![a] })
+        .await
+        .unwrap();
     assert_eq!(p.account_count(), 1);
     let default_acct = p.default_account_for("solo").unwrap();
     assert_eq!(default_acct, "solo@gmail.com");

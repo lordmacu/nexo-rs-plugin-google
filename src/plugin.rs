@@ -143,8 +143,7 @@ impl GooglePlugin {
                 client_id_path: acct.client_id_path.clone(),
                 client_secret_path: acct.client_secret_path.clone(),
             };
-            let client =
-                GoogleAuthClient::new_with_sources(cfg, &workspace_dir, Some(sources));
+            let client = GoogleAuthClient::new_with_sources(cfg, &workspace_dir, Some(sources));
             if let Err(e) = client.load_from_disk().await {
                 tracing::warn!(
                     target = "nexo_plugin_google",
@@ -192,18 +191,15 @@ impl GooglePlugin {
     /// account in the agent's list; errors if the agent has no
     /// accounts.
     pub fn default_account_for(&self, agent_id: &str) -> Result<String> {
-        let list = self
-            .by_agent
-            .get(agent_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "agent `{agent_id}` is not configured for google_auth \
+        let list = self.by_agent.get(agent_id).ok_or_else(|| {
+            anyhow!(
+                "agent `{agent_id}` is not configured for google_auth \
                      (no entry in `google-auth.yaml::accounts[].agent_id`)"
-                )
-            })?;
-        list.first().cloned().ok_or_else(|| {
-            anyhow!("agent `{agent_id}` is configured but has zero accounts")
-        })
+            )
+        })?;
+        list.first()
+            .cloned()
+            .ok_or_else(|| anyhow!("agent `{agent_id}` is configured but has zero accounts"))
     }
 
     /// Pick the account this call targets:
@@ -289,11 +285,7 @@ impl GooglePlugin {
         Ok(json!({ "ok": true, "account": account_id, "response": resp }))
     }
 
-    async fn tool_revoke(
-        &self,
-        client: &Arc<GoogleAuthClient>,
-        account_id: &str,
-    ) -> Result<Value> {
+    async fn tool_revoke(&self, client: &Arc<GoogleAuthClient>, account_id: &str) -> Result<Value> {
         client.revoke().await?;
         Ok(json!({
             "ok": true,
@@ -329,8 +321,7 @@ impl GooglePlugin {
 
     pub async fn admin_list_tokens(&self) -> Result<Value> {
         let mut out: Vec<Value> = Vec::with_capacity(self.accounts.len());
-        let account_ids: Vec<String> =
-            self.accounts.iter().map(|e| e.key().clone()).collect();
+        let account_ids: Vec<String> = self.accounts.iter().map(|e| e.key().clone()).collect();
         for account_id in account_ids {
             let Some(client_arc) = self
                 .accounts

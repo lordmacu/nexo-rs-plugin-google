@@ -13,8 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::plugin::GooglePlugin;
 
-static HANDLE: Lazy<RwLock<Option<Arc<GooglePlugin>>>> =
-    Lazy::new(|| RwLock::new(None));
+static HANDLE: Lazy<RwLock<Option<Arc<GooglePlugin>>>> = Lazy::new(|| RwLock::new(None));
 
 /// Reader handle — returned `None` while boot is in flight.
 pub fn runtime_handle() -> &'static RwLock<Option<Arc<GooglePlugin>>> {

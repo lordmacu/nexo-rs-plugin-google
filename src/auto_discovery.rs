@@ -31,10 +31,7 @@ async fn current_plugin() -> Option<Arc<GooglePlugin>> {
 /// routes to the matching admin verb. Mirrors email's
 /// `admin_handle` shape.
 pub async fn admin_handle(request: &Value) -> Value {
-    let method = request
-        .get("method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
 
     let Some(plugin) = current_plugin().await else {
@@ -112,7 +109,11 @@ pub async fn http_request(request: &Value) -> Value {
     match (method, path) {
         ("GET", "/google/status") => {
             let body = render_status_snapshot().await;
-            respond(200, "application/json; charset=utf-8", body.to_string().as_bytes())
+            respond(
+                200,
+                "application/json; charset=utf-8",
+                body.to_string().as_bytes(),
+            )
         }
         ("GET", "/google/health") => respond(
             200,
@@ -139,7 +140,10 @@ async fn render_status_snapshot() -> Value {
     let account_count = plugin.account_count();
     // Best-effort: include per-account oauth snapshot. Heavy if
     // many accounts, but operators typically have N <= 20.
-    let listing = plugin.admin_list_tokens().await.unwrap_or_else(|_| json!({}));
+    let listing = plugin
+        .admin_list_tokens()
+        .await
+        .unwrap_or_else(|_| json!({}));
     json!({
         "status": "ok",
         "plugin": "google",

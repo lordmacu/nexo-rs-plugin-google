@@ -140,7 +140,10 @@ async fn main() -> anyhow::Result<()> {
             async move { dispatch_tool(plugin, invocation).await }
         });
 
-    tracing::info!(target = "nexo_plugin_google", "JSON-RPC dispatch loop ready");
+    tracing::info!(
+        target = "nexo_plugin_google",
+        "JSON-RPC dispatch loop ready"
+    );
     adapter.run_stdio().await?;
     Ok(())
 }
@@ -167,12 +170,11 @@ async fn dispatch_tool(
     plugin: Arc<GooglePlugin>,
     inv: ToolInvocation,
 ) -> Result<Value, ToolInvocationError> {
-    let agent_id = inv
-        .agent_id
-        .as_deref()
-        .ok_or_else(|| ToolInvocationError::ArgumentInvalid(
+    let agent_id = inv.agent_id.as_deref().ok_or_else(|| {
+        ToolInvocationError::ArgumentInvalid(
             "tool.invoke is missing `agent_id` (daemon must include it)".into(),
-        ))?;
+        )
+    })?;
     match plugin
         .invoke_outbound_tool(&inv.tool_name, inv.args, agent_id)
         .await
@@ -204,13 +206,17 @@ async fn dispatch_tool(
 /// task per request-reply topic family; per-task failure isolation
 /// so one dropped subscriber doesn't kill the rest.
 fn spawn_auto_discovery_subscribers(broker: AnyBroker) {
-    spawn_one(broker.clone(), "plugin.google.admin.>", |_b, payload| async move {
-        auto_discovery::admin_handle(&payload).await
-    });
+    spawn_one(
+        broker.clone(),
+        "plugin.google.admin.>",
+        |_b, payload| async move { auto_discovery::admin_handle(&payload).await },
+    );
     // Phase 94 FU#4 — HTTP route handler.
-    spawn_one(broker, "plugin.google.http.request", |_b, payload| async move {
-        auto_discovery::http_request(&payload).await
-    });
+    spawn_one(
+        broker,
+        "plugin.google.http.request",
+        |_b, payload| async move { auto_discovery::http_request(&payload).await },
+    );
 }
 
 fn spawn_one<F, Fut>(broker: AnyBroker, topic: &'static str, handler: F)

@@ -23,7 +23,10 @@ fn account(id: &str, agent: &str, dir: &Path) -> GoogleAccount {
     }
 }
 
-async fn boot_single_account(agent_id: &str, account_id: &str) -> (Arc<GooglePlugin>, tempfile::TempDir) {
+async fn boot_single_account(
+    agent_id: &str,
+    account_id: &str,
+) -> (Arc<GooglePlugin>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let p = Arc::new(GooglePlugin::new());
     p.on_configure(GoogleAuthFile {
@@ -122,11 +125,7 @@ async fn google_call_requires_method_arg() {
 async fn google_call_requires_url_arg() {
     let (p, _dir) = boot_single_account("agent_x", "agent_x@gmail.com").await;
     let err = p
-        .invoke_outbound_tool(
-            "google_call",
-            json!({ "method": "GET" }),
-            "agent_x",
-        )
+        .invoke_outbound_tool("google_call", json!({ "method": "GET" }), "agent_x")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("`url`"));
