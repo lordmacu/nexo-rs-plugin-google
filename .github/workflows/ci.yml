@@ -1,0 +1,40 @@
+name: ci
+
+# Phase 96 follow-up — gate compile + test on a 3-OS matrix at
+# PR / push time. The release.yml workflow (added separately)
+# handles cross-target binary publication on tag push.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_NET_RETRY: 10
+  CARGO_NET_TIMEOUT: 60
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt -- --check
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets --no-deps -- -D warnings
+      - run: cargo build --locked
+      - run: cargo test --locked
