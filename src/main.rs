@@ -186,9 +186,7 @@ async fn dispatch_tool(
             // -33401..-33405 typed band the daemon decodes.
             if msg.contains("unknown tool") {
                 Err(ToolInvocationError::NotFound(msg))
-            } else if msg.contains("not configured") {
-                Err(ToolInvocationError::Unavailable(msg))
-            } else if msg.contains("circuit breaker open") {
+            } else if msg.contains("not configured") || msg.contains("circuit breaker open") {
                 Err(ToolInvocationError::Unavailable(msg))
             } else if msg.contains("requires `method`")
                 || msg.contains("requires `url`")
