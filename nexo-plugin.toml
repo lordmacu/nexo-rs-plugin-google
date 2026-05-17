@@ -15,7 +15,7 @@ manifest_version = 2
 
 [plugin]
 id               = "google"
-version          = "0.2.1"
+version          = "0.3.0"
 name             = "Google Workspace"
 description      = "Google OAuth + Gmail/Calendar/Drive API tool plugin for Nexo agents."
 min_nexo_version = ">=0.1.19"
@@ -39,6 +39,7 @@ subscribe = [
     "plugin.outbound.google",
     "plugin.outbound.google.>",
     "plugin.google.admin.>",
+    "plugin.google.http.request",
 ]
 publish = []
 
@@ -75,6 +76,15 @@ tools = [
 method_prefix       = "nexo/admin/google/"
 broker_topic_prefix = "plugin.google.admin"
 timeout_seconds     = 15
+
+# Phase 94 FU#4 — daemon mounts HTTP proxy under `/google`.
+# Forwards requests via broker JSON-RPC. The plugin owns its
+# internal router; today only `/google/status` exists (returns
+# plugin metadata + per-account OAuth status snapshot). Future
+# routes can land without daemon-side path-matchers.
+[plugin.http]
+mount_prefix    = "/google"
+timeout_seconds = 15
 
 # Phase 93.4 — declarative config contract. Daemon delivers
 # Phase 94 v0.2.1 — operator YAML at

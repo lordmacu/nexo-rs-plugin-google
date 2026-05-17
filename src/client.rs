@@ -147,6 +147,12 @@ pub struct GoogleAuthClient {
     /// receipt of the redirect. One listener at a time — a second
     /// `start_auth_flow` cancels the previous.
     pending_auth: RwLock<Option<oneshot::Sender<Result<GoogleTokens>>>>,
+    /// Phase 94 FU#3 — PKCE (RFC 7636) code_verifier captured at
+    /// `start_auth_flow`-time and consumed by `exchange_code` so
+    /// Google can confirm the auth_code redemption belongs to the
+    /// same client that started the flow. Replaces reliance on
+    /// `client_secret` alone for desktop / installed-app OAuth.
+    pending_verifier: RwLock<Option<String>>,
     http: reqwest::Client,
     /// Optional file paths the client consults for lazy-refresh of
     /// client_id / client_secret. Mtime stored alongside so we only
@@ -198,6 +204,7 @@ impl GoogleAuthClient {
             token_path,
             tokens: RwLock::new(None),
             pending_auth: RwLock::new(None),
+            pending_verifier: RwLock::new(None),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -286,11 +293,24 @@ impl GoogleAuthClient {
     /// for `access_type=offline` + `prompt=consent` so the first
     /// approval yields a refresh_token. Subsequent prompts reuse that
     /// refresh — see `GoogleTokens::refresh_token` docstring.
+    ///
+    /// Phase 94 FU#3 — when `code_challenge` is `Some`, includes
+    /// PKCE S256 parameters per RFC 7636. The verifier must be
+    /// stashed elsewhere (via `start_auth_flow`'s
+    /// `pending_verifier`) so `exchange_code` can submit it.
     pub fn build_auth_url(&self, state: &str) -> String {
+        self.build_auth_url_with_pkce(state, None)
+    }
+
+    /// PKCE-aware variant. Pass `Some(challenge)` to enable RFC
+    /// 7636 S256 binding between the auth URL and the token
+    /// exchange. Operator-driven `--oauth-once` flows reuse the
+    /// vanilla `build_auth_url` for back-compat.
+    pub fn build_auth_url_with_pkce(&self, state: &str, code_challenge: Option<&str>) -> String {
         let cfg = self.config.load_full();
         let redirect_uri = format!("http://127.0.0.1:{}/callback", cfg.redirect_port);
         let scopes = canonicalize_scopes(&cfg.scopes).join(" ");
-        let params = [
+        let mut params: Vec<(&str, &str)> = vec![
             ("client_id", cfg.client_id.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("response_type", "code"),
@@ -299,6 +319,10 @@ impl GoogleAuthClient {
             ("prompt", "consent"),
             ("state", state),
         ];
+        if let Some(challenge) = code_challenge {
+            params.push(("code_challenge", challenge));
+            params.push(("code_challenge_method", "S256"));
+        }
         let qs = serde_urlencoded::to_string(params).unwrap_or_default();
         format!("https://accounts.google.com/o/oauth2/v2/auth?{qs}")
     }
@@ -333,7 +357,12 @@ impl GoogleAuthClient {
         // Short-lived random state lets the listener verify the redirect
         // belongs to THIS flow (not a stale tab from minutes ago).
         let state = format!("{:016x}", rand_u64());
-        let url = self.build_auth_url(&state);
+        // Phase 94 FU#3 — PKCE S256 (RFC 7636). Generate verifier
+        // + challenge before building the URL so the URL carries
+        // `code_challenge` + the listener stash holds `verifier`
+        // for `exchange_code`.
+        let (verifier, challenge) = generate_pkce_pair();
+        let url = self.build_auth_url_with_pkce(&state, Some(&challenge));
 
         let (tx, rx) = oneshot::channel::<Result<GoogleTokens>>();
         {
@@ -341,6 +370,10 @@ impl GoogleAuthClient {
             // If there's an older pending flow, drop its sender — the
             // caller gets "Err(channel closed)" when they poll.
             *slot = Some(tx);
+        }
+        {
+            let mut slot = self.pending_verifier.write().await;
+            *slot = Some(verifier);
         }
 
         let this = Arc::clone(self);
@@ -426,13 +459,24 @@ impl GoogleAuthClient {
         self.refresh_secrets_if_changed().await.ok();
         let cfg = self.config.load_full();
         let redirect_uri = self.redirect_uri();
-        let form = [
+        // Phase 94 FU#3 — PKCE: consume the verifier stashed by
+        // start_auth_flow. Take()-style: the verifier is single-use
+        // per consent. Absent means non-PKCE flow (operator
+        // --oauth-once defaults to no PKCE for back-compat).
+        let verifier = {
+            let mut slot = self.pending_verifier.write().await;
+            slot.take()
+        };
+        let mut form: Vec<(&str, &str)> = vec![
             ("code", code),
             ("client_id", cfg.client_id.as_str()),
             ("client_secret", cfg.client_secret.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
         ];
+        if let Some(v) = verifier.as_deref() {
+            form.push(("code_verifier", v));
+        }
         let body = self
             .run_breakered(|| async {
                 let resp = self
@@ -819,6 +863,31 @@ fn rand_u64() -> u64 {
         ^ (std::process::id() as u64).wrapping_mul(2654435761)
 }
 
+/// Phase 94 FU#3 — RFC 7636 PKCE pair generator.
+///
+/// Returns `(verifier, challenge)` where:
+/// - `verifier` is a 43-128-char URL-safe random string (we
+///   pick 64 bytes → 86 base64url chars, within the spec range).
+/// - `challenge` is `base64url(sha256(verifier))` no padding.
+///
+/// Caller passes `challenge` to `build_auth_url_with_pkce` and
+/// keeps `verifier` for `exchange_code`'s `code_verifier` form
+/// field.
+pub fn generate_pkce_pair() -> (String, String) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+
+    let mut bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+    (verifier, challenge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,5 +941,59 @@ mod tests {
         assert_eq!(urldecode("hello+world"), "hello world");
         assert_eq!(urldecode("hello%20world"), "hello world");
         assert_eq!(urldecode("4%2F0AbcdEF"), "4/0AbcdEF");
+    }
+
+    #[test]
+    fn pkce_pair_is_rfc7636_compliant() {
+        let (verifier, challenge) = generate_pkce_pair();
+        // Verifier within RFC 7636 §4.1 length bounds [43, 128].
+        assert!(verifier.len() >= 43 && verifier.len() <= 128);
+        // Verifier must be url-safe (no `+`, `/`, or `=` padding).
+        for c in verifier.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "verifier contains non-url-safe char: {c:?}"
+            );
+        }
+        // Challenge derived from verifier — same call must yield
+        // a different pair (random verifier).
+        let (verifier2, _) = generate_pkce_pair();
+        assert_ne!(verifier, verifier2, "verifier must be random");
+        // Challenge length is fixed 43 chars (sha256 → 32 bytes →
+        // base64url 43 chars no padding).
+        assert_eq!(challenge.len(), 43);
+    }
+
+    #[test]
+    fn build_auth_url_with_pkce_includes_challenge_and_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GoogleAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "cs".into(),
+            scopes: vec!["gmail.readonly".into()],
+            token_file: dir.path().join("tok.json").to_string_lossy().into_owned(),
+            redirect_port: 8765,
+        };
+        let client = GoogleAuthClient::new(cfg, dir.path());
+        let url = client.build_auth_url_with_pkce("state-xyz", Some("challenge-abc"));
+        assert!(url.contains("code_challenge=challenge-abc"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=state-xyz"));
+    }
+
+    #[test]
+    fn build_auth_url_without_pkce_omits_challenge_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GoogleAuthConfig {
+            client_id: "cid".into(),
+            client_secret: "cs".into(),
+            scopes: vec!["gmail.readonly".into()],
+            token_file: dir.path().join("tok.json").to_string_lossy().into_owned(),
+            redirect_port: 8765,
+        };
+        let client = GoogleAuthClient::new(cfg, dir.path());
+        let url = client.build_auth_url("state-xyz");
+        assert!(!url.contains("code_challenge"));
+        assert!(!url.contains("code_challenge_method"));
     }
 }

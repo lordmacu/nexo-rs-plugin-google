@@ -204,8 +204,12 @@ async fn dispatch_tool(
 /// task per request-reply topic family; per-task failure isolation
 /// so one dropped subscriber doesn't kill the rest.
 fn spawn_auto_discovery_subscribers(broker: AnyBroker) {
-    spawn_one(broker, "plugin.google.admin.>", |_b, payload| async move {
+    spawn_one(broker.clone(), "plugin.google.admin.>", |_b, payload| async move {
         auto_discovery::admin_handle(&payload).await
+    });
+    // Phase 94 FU#4 — HTTP route handler.
+    spawn_one(broker, "plugin.google.http.request", |_b, payload| async move {
+        auto_discovery::http_request(&payload).await
     });
 }
 

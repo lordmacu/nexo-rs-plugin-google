@@ -1,15 +1,9 @@
-//! Phase 81.33.b.real Stage 4 — auto-discovery broker handler for
-//! admin RPC commands. Daemon receives `nexo/admin/google/<verb>`
-//! from operators and forwards to `plugin.google.admin.<verb>` —
-//! this module owns the in-process side of that contract.
+//! Phase 81.33.b.real Stage 4 + Phase 94 FU#4 — auto-discovery
+//! broker handlers for admin RPC + HTTP routes.
 //!
-//! Other auto-discovery stages (pairing/http/metrics) are NOT
-//! wired for google in v0.2.0:
+//! Other auto-discovery stages NOT yet wired for google:
 //!   * Pairing: google has its own `--oauth-once` CLI subcommand;
 //!     no broker-pairing surface needed.
-//!   * HTTP: no long-lived HTTP routes mounted (the loopback
-//!     listener lives inside `--oauth-once`'s lifetime, not as a
-//!     daemon-routed endpoint).
 //!   * Metrics: no Prometheus counters today (follow-up).
 //!
 //! All handler functions are `async` + return a `serde_json::Value`
@@ -99,6 +93,70 @@ pub async fn admin_handle(request: &Value) -> Value {
             "error": format!("unknown admin method: {other}"),
         }),
     }
+}
+
+// ── Phase 94 FU#4 — HTTP route handler ─────────────────────────
+
+/// `plugin.google.http.request` broker handler. The daemon's
+/// `PluginHttpRouter` (Phase 81.33.b.real Stage 2) maps requests
+/// arriving at `/google/<path>` onto this RPC; the plugin's
+/// internal router answers + returns the canonical
+/// `{status, headers, body_base64}` envelope. Mirrors email's
+/// shape.
+pub async fn http_request(request: &Value) -> Value {
+    let path = request.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let method = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET");
+    match (method, path) {
+        ("GET", "/google/status") => {
+            let body = render_status_snapshot().await;
+            respond(200, "application/json; charset=utf-8", body.to_string().as_bytes())
+        }
+        ("GET", "/google/health") => respond(
+            200,
+            "application/json; charset=utf-8",
+            br#"{"status":"ok"}"#,
+        ),
+        _ => respond(
+            404,
+            "application/json; charset=utf-8",
+            br#"{"error":"not found"}"#,
+        ),
+    }
+}
+
+async fn render_status_snapshot() -> Value {
+    let Some(plugin) = current_plugin().await else {
+        return json!({
+            "status": "booting",
+            "plugin": "google",
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+    };
+    let agent_count = plugin.agent_count();
+    let account_count = plugin.account_count();
+    // Best-effort: include per-account oauth snapshot. Heavy if
+    // many accounts, but operators typically have N <= 20.
+    let listing = plugin.admin_list_tokens().await.unwrap_or_else(|_| json!({}));
+    json!({
+        "status": "ok",
+        "plugin": "google",
+        "version": env!("CARGO_PKG_VERSION"),
+        "agents": agent_count,
+        "accounts": account_count,
+        "listing": listing,
+    })
+}
+
+fn respond(status: u16, content_type: &str, body: &[u8]) -> Value {
+    use base64::Engine;
+    json!({
+        "status": status,
+        "headers": [["Content-Type", content_type]],
+        "body_base64": base64::engine::general_purpose::STANDARD.encode(body),
+    })
 }
 
 #[cfg(test)]

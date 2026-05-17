@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.0 — 2026-05-17
+
+Phase 94 FU#3 + FU#4 close-out. Two additive features:
+
+### Added
+
+- **PKCE (RFC 7636 S256) on the loopback OAuth flow.** `start_auth_flow`
+  generates a 64-byte random `code_verifier` + `code_challenge =
+  base64url(sha256(verifier))` and stashes the verifier in
+  `pending_verifier`. `build_auth_url_with_pkce` adds
+  `code_challenge` + `code_challenge_method=S256` to the consent
+  URL; `exchange_code` includes `code_verifier` in the token
+  POST. Defense-in-depth over `client_secret` alone for desktop
+  installed-app OAuth. Mining reference:
+  `research/extensions/google/oauth.flow.ts:17`.
+  - New public helper `generate_pkce_pair() -> (String, String)`.
+  - `build_auth_url(state)` unchanged (no PKCE) — preserves
+    back-compat for the device-code flow and `--oauth-once`
+    invocations that don't open a loopback listener.
+  - `build_auth_url_with_pkce(state, Some(challenge))` is the
+    new PKCE-aware variant.
+
+- **`[plugin.http]` route mount** at `/google`. Daemon's
+  `PluginHttpRouter` (Phase 81.33.b.real Stage 2) proxies
+  HTTP requests to the plugin via the new
+  `plugin.google.http.request` broker handler.
+  - `GET /google/status` — JSON snapshot: plugin metadata +
+    `agents` + `accounts` counts + per-account oauth listing.
+  - `GET /google/health` — `{ "status": "ok" }`.
+  - 404 for unknown paths.
+
+### Manifest changes
+
+```toml
+[plugin.capabilities.broker]
+subscribe = [
+    ...,
+    "plugin.google.http.request",   # NEW
+]
+
+[plugin.http]                       # NEW section
+mount_prefix    = "/google"
+timeout_seconds = 15
+```
+
+### Bumps
+
+- nexo-plugin-google `0.2.1 → 0.3.0`.
+- New deps: `sha2 = "0.10"` + `base64 = "0.22"` (PKCE machinery).
+
 ## 0.2.1 — 2026-05-16
 
 Fixes runtime gaps discovered after the 0.2.0 release. **0.2.0 has

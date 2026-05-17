@@ -11,7 +11,7 @@ fn manifest_parses_as_v2() {
         toml::from_str(MANIFEST).expect("nexo-plugin.toml parses as PluginManifest");
     assert_eq!(parsed.manifest_version, 2, "must be v2 canonical");
     assert_eq!(parsed.plugin.id, "google");
-    assert_eq!(parsed.plugin.version.to_string(), "0.2.1");
+    assert_eq!(parsed.plugin.version.to_string(), "0.3.0");
 }
 
 #[test]
