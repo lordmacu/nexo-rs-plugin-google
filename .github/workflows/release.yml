@@ -1,0 +1,194 @@
+name: release
+
+# Tag push (`v0.3.0`, …) builds release binaries for every target the
+# `nexo-rs` daemon ships for and creates a GitHub Release in the
+# layout `nexo plugin install` expects:
+#   * bare `nexo-plugin.toml` at release root
+#   * `<plugin_id>-<version>-<target>.tar.gz` containing
+#     `nexo-plugin.toml` + `bin/<plugin_id>` at archive root
+#   * `<...>.tar.gz.sha256` sidecar with the hex digest
+#
+# Also publishes the source crate to crates.io (idempotent) so
+# operators can pick whichever install path they prefer:
+#   * `cargo install nexo-plugin-google`                       (source)
+#   * `nexo plugin install lordmacu/nexo-rs-plugin-google`     (precompiled)
+#
+# Targets: x86_64/aarch64 musl static + x86_64/aarch64 macOS (via
+# cargo-zigbuild) + x86_64 Windows MSVC (native build on windows-latest).
+#
+# Required repo secret: `CARGO_REGISTRY_TOKEN`.
+# workflow_dispatch exposed as a manual rerun escape hatch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_NET_TIMEOUT: "60"
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Reject lingering path deps in Cargo.toml
+        run: |
+          if grep -E '^\s*nexo-.*path\s*=' Cargo.toml; then
+            echo "ERROR: path deps detected — flip to crates.io before tagging" >&2
+            exit 1
+          fi
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run
+
+      - name: cargo publish (idempotent — skip if already on crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set +e
+          cargo publish 2>&1 | tee publish.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -eq 0 ]; then
+            echo "Published"
+            exit 0
+          fi
+          if grep -q "already exists on crates.io index" publish.log; then
+            echo "Version already on crates.io — treating as success (idempotent release)"
+            exit 0
+          fi
+          echo "cargo publish failed for non-idempotent reason"
+          exit $rc
+
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nexo-rs-plugin-google
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (ring's cc-rs build.rs needs *-linux-musl-gcc)
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: CFLAGS for sqlite-vec on musl (BSD u_intN_t typedefs)
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          MUSL_CFLAGS='-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t'
+          echo "CFLAGS_x86_64_unknown_linux_musl=${MUSL_CFLAGS}"  >> "$GITHUB_ENV"
+          echo "CFLAGS_aarch64_unknown_linux_musl=${MUSL_CFLAGS}" >> "$GITHUB_ENV"
+
+      - name: Install zig (pinned)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.13.0"
+      - name: Install cargo-zigbuild
+        if: ${{ !contains(matrix.target, 'windows') }}
+        run: cargo install cargo-zigbuild --locked --version 0.22.3
+
+      - name: Build (Unix — cargo-zigbuild)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        working-directory: nexo-rs-plugin-google
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Build (Windows — native cargo)
+        if: contains(matrix.target, 'windows')
+        working-directory: nexo-rs-plugin-google
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: package (nexo plugin install layout)
+        working-directory: nexo-rs-plugin-google
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/staging/bin
+          BIN="target/${{ matrix.target }}/release/nexo-plugin-google"
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" dist/staging/bin/google
+          cp nexo-plugin.toml dist/staging/nexo-plugin.toml
+
+          PLUGIN_ID=$(grep -E '^id[[:space:]]*=' nexo-plugin.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION=$(grep -E '^version[[:space:]]*=' nexo-plugin.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          TARBALL="${PLUGIN_ID}-${VERSION}-${{ matrix.target }}.tar.gz"
+
+          tar czf "dist/${TARBALL}" -C dist/staging bin/google nexo-plugin.toml
+          { sha256sum "dist/${TARBALL}" 2>/dev/null || shasum -a 256 "dist/${TARBALL}"; } | awk '{print $1}' > "dist/${TARBALL}.sha256"
+          cp nexo-plugin.toml dist/nexo-plugin.toml
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            nexo-rs-plugin-google/dist/*.tar.gz
+            nexo-rs-plugin-google/dist/*.tar.gz.sha256
+            nexo-rs-plugin-google/dist/nexo-plugin.toml
+
+  github:
+    name: github release
+    needs: build
+    # softprops/action-gh-release needs a real tag at GITHUB_REF.
+    # Skip on workflow_dispatch (where ref is a branch, not a tag).
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+      # Dedupe nexo-plugin.toml — each matrix entry uploads its own
+      # copy (5 artifacts × 1 toml each), so `dist/**/nexo-plugin.toml`
+      # matches 5 paths. softprops/action-gh-release then tries to
+      # upload the same filename 5× in parallel → "asset already
+      # exists" 422 race. Collapse to a single canonical copy at
+      # `dist/nexo-plugin.toml` before the upload glob runs.
+      - name: Dedupe nexo-plugin.toml + sort tarballs
+        run: |
+          set -euo pipefail
+          ANY_TOML="$(find dist -type f -name nexo-plugin.toml | head -1)"
+          if [ -z "${ANY_TOML}" ]; then
+            echo "::error::no nexo-plugin.toml in artifacts"
+            exit 1
+          fi
+          find dist -type f -name nexo-plugin.toml -delete
+          cp "${ANY_TOML}" dist/nexo-plugin.toml
+          echo "Final upload set:"
+          find dist -maxdepth 2 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' -o -name 'nexo-plugin.toml' \) | sort
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.tar.gz.sha256
+            dist/nexo-plugin.toml
+          generate_release_notes: true
