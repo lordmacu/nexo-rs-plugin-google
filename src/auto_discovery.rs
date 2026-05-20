@@ -85,11 +85,64 @@ pub async fn admin_handle(request: &Value) -> Value {
             Err(e) => json!({ "ok": false, "error": format!("{e}") }),
         },
 
+        // Phase 99 — admin UI (Mode A dynamic). The daemon forwards
+        // `describe` here; we build the live OAuth-status screen.
+        "nexo/admin/google/admin_ui/describe" => {
+            let status = match plugin.admin_list_tokens().await {
+                Ok(v) => v,
+                Err(e) => json!({ "error": format!("{e}") }),
+            };
+            json!({ "ok": true, "result": oauth_screen_descriptor(status) })
+        }
+
+        // OAuth screen is read-only (status + actions); nothing to
+        // persist. Return the ConfigSetResponse envelope so the UI
+        // save path is a clean no-op.
+        "nexo/admin/google/admin_ui/config_set" => json!({
+            "ok": true,
+            "result": { "ok": true, "errors": [] },
+        }),
+
         other => json!({
             "ok": false,
             "error": format!("unknown admin method: {other}"),
         }),
     }
+}
+
+/// Phase 99 — build the live OAuth-status `ScreenDescriptor`
+/// (nexo-tool-meta wire shape) the admin UI renders. A read-only
+/// status field + a `revoke` action + a refresh widget, all reusing
+/// the plugin's existing `list_tokens` / `oauth_revoke` admin verbs
+/// (zero new dispatch surface beyond this descriptor).
+fn oauth_screen_descriptor(status: Value) -> Value {
+    json!({
+        "plugin": "google",
+        "screen_id": "oauth",
+        "title": "Google OAuth",
+        "fields": [
+            {
+                "key": "status",
+                "field_type": "json",
+                "label": "Token status",
+                "required": false,
+                "value": status,
+            }
+        ],
+        "actions": [
+            {
+                "id": "revoke",
+                "label": "Revoke account",
+                "method": "nexo/admin/google/oauth_revoke",
+                "prompt_fields": [
+                    { "key": "agent_id", "field_type": "text", "label": "Agent id", "required": true },
+                    { "key": "account", "field_type": "text", "label": "Account (optional)", "required": false }
+                ],
+                "on_success": "refresh",
+            }
+        ],
+        "refresh": { "method": "nexo/admin/google/list_tokens" },
+    })
 }
 
 // ── Phase 94 FU#4 — HTTP route handler ─────────────────────────
@@ -168,6 +221,20 @@ mod tests {
     use super::*;
     use crate::plugin::{GoogleAccount, GoogleAuthFile, GooglePlugin};
     use serial_test::serial;
+
+    #[test]
+    fn oauth_descriptor_has_status_field_revoke_action_and_refresh() {
+        let d = oauth_screen_descriptor(json!({"agents": []}));
+        assert_eq!(d["screen_id"], "oauth");
+        assert_eq!(d["fields"][0]["key"], "status");
+        assert_eq!(d["fields"][0]["field_type"], "json");
+        // status value is the passed-in token snapshot.
+        assert_eq!(d["fields"][0]["value"], json!({"agents": []}));
+        assert_eq!(d["actions"][0]["id"], "revoke");
+        assert_eq!(d["actions"][0]["method"], "nexo/admin/google/oauth_revoke");
+        assert_eq!(d["actions"][0]["prompt_fields"][0]["key"], "agent_id");
+        assert_eq!(d["refresh"]["method"], "nexo/admin/google/list_tokens");
+    }
 
     async fn boot_with_one_agent() -> Arc<GooglePlugin> {
         let dir = tempfile::tempdir().unwrap();

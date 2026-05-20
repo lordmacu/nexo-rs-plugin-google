@@ -143,3 +143,12 @@ subdir = "google"
 [plugin.dashboard.auth_check]
 kind       = "session_dir_files"
 candidates = ["google_tokens.json"]
+
+# Phase 99 — admin UI contribution: the [plugin.admin_ui] section
+# (dynamic OAuth-status screen) is BLOCKED on publishing a
+# nexo-plugin-manifest version that carries the `admin_ui` field —
+# this plugin pins the crates.io release (deny_unknown_fields makes
+# the new section a hard parse error until then). The broker
+# handlers (`admin_ui/describe` + `admin_ui/config_set`) already
+# ship in src/auto_discovery.rs, ready to activate once the section
+# is added post-publish. See FOLLOWUPS Phase 99.
