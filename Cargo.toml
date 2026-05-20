@@ -78,7 +78,7 @@ nexo-config          = "0.1.9"
 nexo-llm             = "0.1.5"
 nexo-auth            = "0.1.8"
 nexo-resilience      = "0.1.3"
-nexo-plugin-manifest = "0.1.6"
+nexo-plugin-manifest = "0.1.8"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha2 = "0.10.9"
 base64 = "0.22.1"

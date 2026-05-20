@@ -144,11 +144,30 @@ subdir = "google"
 kind       = "session_dir_files"
 candidates = ["google_tokens.json"]
 
-# Phase 99 — admin UI contribution: the [plugin.admin_ui] section
-# (dynamic OAuth-status screen) is BLOCKED on publishing a
-# nexo-plugin-manifest version that carries the `admin_ui` field —
-# this plugin pins the crates.io release (deny_unknown_fields makes
-# the new section a hard parse error until then). The broker
-# handlers (`admin_ui/describe` + `admin_ui/config_set`) already
-# ship in src/auto_discovery.rs, ready to activate once the section
-# is added post-publish. See FOLLOWUPS Phase 99.
+# ────────────────────────────────────────────────────────────────
+# Phase 99 — admin UI contribution (Mode A, dynamic).
+#
+# Google's config is file-path-based OAuth accounts (not an
+# operator-editable form), so the admin UI is DYNAMIC
+# (`describe = true`): the plugin serves a live OAuth-status screen
+# via `nexo/admin/google/admin_ui/describe` (reusing
+# `admin_list_tokens`), with a `revoke` action wired to the existing
+# `oauth_revoke` handler + a refresh widget on `list_tokens`. See
+# `src/auto_discovery.rs`. Requires nexo-plugin-manifest >= 0.1.8.
+# ────────────────────────────────────────────────────────────────
+[plugin.admin_ui]
+schema_version = 1
+mode           = "declarative"
+describe       = true
+
+[[plugin.admin_ui.contributions]]
+id     = "google"
+slot   = "plugin.google.root"
+label  = "Google"
+icon   = "mail"
+order  = 1000
+screen = "oauth"
+
+[[plugin.admin_ui.screens]]
+id    = "oauth"
+title = "Google OAuth"
